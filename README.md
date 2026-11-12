@@ -70,7 +70,18 @@ operands accept `123` or `0x7B`.
 | Maths | `ADD n` `SUB n` `INC` `DEC` |
 | Logic | `AND n` `ORA n` `XOR n` `SHL` `SHR` `CMP n` |
 | Flow | `JMP label` `JZ label` `JNZ label` `JC label` `DLY n` `HLT` `NOP` |
+| Subroutines | `CALL label` `RET` `PSH` (push A) `POP` (pop into A) |
 | Pins | `OUT p` (drive pin p with A) `OFF p` (high-Z) `IN p` (analog 0-255) `DIN p` (digital) |
+| Parallel port | `NIB` (low nibble of A onto all four pins) `RNIB` (read all four pins as bits) |
+| Interrupts | `IRQ0 label` .. `IRQ3 label` (fire on a rising edge on that pin) `IRQCLR` |
+
+The stack is 16 levels deep and shared by `CALL` and interrupts, so a handler ends with
+`RET` just like a subroutine. `IRQn` is one shot: re-arm it inside the handler. Overflow,
+or a `RET` with an empty stack, halts the chip with the reason in the tooltip instead of
+silently corrupting anything.
+
+A four bit parallel port tooltip on the chip shows stack depth, armed interrupts and how
+many were taken.
 
 ```
 ; blink whatever is wired to the right pin

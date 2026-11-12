@@ -213,8 +213,11 @@ def mat_melt(cell):
 
 CPU_OPS = ("NOP", "HLT", "LDA", "LDB", "ADD", "SUB", "INC", "DEC", "AND",
            "ORA", "XOR", "SHL", "SHR", "CMP", "JMP", "JZ", "JNZ", "JC",
-           "OUT", "OFF", "IN", "DIN", "DLY", "ST", "LD")
+           "OUT", "OFF", "IN", "DIN", "DLY", "ST", "LD",
+           "CALL", "RET", "PSH", "POP", "NIB", "RNIB",
+           "IRQ0", "IRQ1", "IRQ2", "IRQ3", "IRQCLR")
 CPU_MEM = 32
+CPU_STACK = 16
 CPU_ROUT = 40.0        # output stage impedance in ohm (a real MCU-ish pin)
 CPU_MIN_V = 2.5        # supply needed before it will run
 CPU_LOAD_A = 0.020     # current it pulls from the strongest rail
@@ -256,7 +259,17 @@ loop:
   JMP loop
 '''
 
-CPU_TEMPLATES = (CPU_DEMO, CPU_DEMO2)
+CPU_DEMO3 = '''; 4-bit binary counter across all four pins
+  LDA 0
+loop:
+  NIB
+  ADD 1
+  AND 15
+  DLY 2
+  JMP loop
+'''
+
+CPU_TEMPLATES = (CPU_DEMO, CPU_DEMO2, CPU_DEMO3)
 
 
 def cpu_assemble(text):
@@ -268,7 +281,7 @@ def cpu_assemble(text):
         while ":" in s:
             lab, rest = s.split(":", 1)
             lab = lab.strip()
-            if not lab or " " in lab or lab.upper() in CPU_OPS:
+            if not lab or " " in lab:
                 break
             labels[lab.upper()] = len(ins)
             s = rest.strip()
@@ -371,6 +384,11 @@ class Cell:
             e["lv"] = [0, 0, 0, 0]
             e["pd"] = ["in", "in", "in", "in"]
             e["mem"] = [0] * CPU_MEM
+            e["sp"] = 0
+            e["stack"] = []
+            e["irq"] = [-1, -1, -1, -1]
+            e["irl"] = [0, 0, 0, 0]
+            e["irqs"] = 0
             e["cn"] = []
             e["rail_n"] = []
             e["rail_e"] = []
@@ -1058,7 +1076,30 @@ class Board:
             while e["acc"] >= 1.0 and guard < 48:
                 e["acc"] -= 1.0
                 guard += 1
+                self._cpu_irq(c)
                 self.cpu_exec(c)
+
+    # rising edge on an armed pin pushes the PC and vectors into its handler
+    def _cpu_irq(self, c):
+        e = c.extra
+        armed = e["irq"]
+        if not e["code"] or not any(h >= 0 for h in armed):
+            return
+        ref = e["vcc"] if e["vcc"] > 0.5 else 5.0
+        for p in range(4):
+            h = armed[p]
+            high = e["vp"][p] > ref * 0.5
+            if high and not e["irl"][p]:
+                e["irl"][p] = 1
+                if h >= 0 and e["sp"] < CPU_STACK:
+                    e["stack"].append(e["pc"])
+                    e["sp"] += 1
+                    e["pc"] = h % len(e["code"])
+                    e["irqs"] += 1
+                    armed[p] = -1
+                    return
+            elif not high:
+                e["irl"][p] = 0
 
     def cpu_exec(self, c):
         """Run one instruction.  Jumps set the program counter directly."""
@@ -1142,6 +1183,49 @@ class Board:
             e["mem"][a % CPU_MEM] = A
         elif op == "LD":
             A = e["mem"][a % CPU_MEM]
+        elif op == "CALL":
+            if e["sp"] >= CPU_STACK:
+                e["halt"] = 1
+                e["err"] = "stack overflow"
+                return
+            e["stack"].append(e["pc"])
+            e["sp"] += 1
+            e["pc"] = a % len(code)
+        elif op == "RET":
+            if not e["stack"]:
+                e["halt"] = 1
+                e["err"] = "RET with an empty stack"
+                return
+            e["pc"] = e["stack"].pop() % len(code)
+            e["sp"] -= 1
+        elif op == "PSH":
+            if e["sp"] >= CPU_STACK:
+                e["halt"] = 1
+                e["err"] = "stack overflow"
+                return
+            e["stack"].append(A)
+            e["sp"] += 1
+        elif op == "POP":
+            A = e["stack"].pop() if e["stack"] else 0
+            if e["sp"] > 0:
+                e["sp"] -= 1
+        elif op == "NIB":
+            for d in range(4):
+                e["pd"][d] = "out"
+                e["lv"][d] = 255 if (A >> d) & 1 else 0
+        elif op == "RNIB":
+            ref = e["vcc"] if e["vcc"] > 0.5 else 5.0
+            A = 0
+            for d in range(4):
+                if e["vp"][d] > ref * 0.5:
+                    A |= 1 << d
+        elif op in ("IRQ0", "IRQ1", "IRQ2", "IRQ3"):
+            p = int(op[3])
+            e["irq"][p] = a % len(code)
+            ref = e["vcc"] if e["vcc"] > 0.5 else 5.0
+            e["irl"][p] = 1 if e["vp"][p] > ref * 0.5 else 0
+        elif op == "IRQCLR":
+            e["irq"] = [-1, -1, -1, -1]
         e["a"] = A & 0xFF
         e["b"] = B & 0xFF
         e["c"] = C
@@ -1315,6 +1399,50 @@ def selftest():
     for _ in range(30):
         cb.step(1 / 30)
     check("cpu stops when its supply is pulled", cpu.extra["run"] == 0)
+
+    cb = Board()
+    cc = Cell("cpu")
+    cc.extra["code"] = cpu_assemble("CALL sub\nLDA 9\nHLT\nsub:\nLDA 5\nRET")[0]
+    for _ in range(8):
+        cb.cpu_exec(cc)
+    check("cpu CALL / RET returns to the caller", cc.extra["a"] == 9 and cc.extra["halt"] == 1,
+          f"A={cc.extra['a']} sp={cc.extra['sp']}")
+    cc.extra["code"] = cpu_assemble("LDA 7\nPSH\nLDA 0\nPOP\nHLT")[0]
+    cc.extra.update(pc=0, halt=0, wait=0, sp=0)
+    cc.extra["stack"] = []
+    for _ in range(8):
+        cb.cpu_exec(cc)
+    check("cpu PSH / POP round trips a byte", cc.extra["a"] == 7, f"A={cc.extra['a']}")
+    cc.extra["code"] = cpu_assemble("LDA 10\nNIB\nHLT")[0]
+    cc.extra.update(pc=0, halt=0, wait=0)
+    for _ in range(4):
+        cb.cpu_exec(cc)
+    check("cpu NIB drives a 4-bit parallel port", cc.extra["lv"] == [0, 255, 0, 255],
+          f"pins {cc.extra['lv']} for 10 = 1010b")
+    cc.extra["code"] = cpu_assemble("RNIB\nHLT")[0]
+    cc.extra.update(pc=0, halt=0, wait=0, a=0, vcc=5.0)
+    cc.extra["vp"] = [5.0, 0.0, 5.0, 0.0]
+    for _ in range(3):
+        cb.cpu_exec(cc)
+    check("cpu RNIB reads the port back", cc.extra["a"] == 5, f"A={cc.extra['a']} (bits 0,2)")
+    cc.extra["code"] = cpu_assemble("LDA 1\nloop:\nJMP loop\nIRQ1 handler\nHLT\nhandler:\nLDA 3\nHLT")[0]
+    cc.extra.update(pc=0, halt=0, wait=0, sp=0, irqs=0)
+    cc.extra["stack"] = []
+    cc.extra["irq"] = [-1, -1, -1, -1]
+    cc.extra["irl"] = [0, 0, 0, 0]
+    cc.extra["vp"] = [0.0, 5.0, 0.0, 0.0]
+    cc.extra["irq"][1] = len(cc.extra["code"]) - 2
+    cb._cpu_irq(cc)
+    check("cpu vectors into an interrupt handler", cc.extra["pc"] == len(cc.extra["code"]) - 2
+          and cc.extra["sp"] == 1 and cc.extra["irqs"] == 1,
+          f"pc={cc.extra['pc']} sp={cc.extra['sp']}")
+    cc.extra["code"] = cpu_assemble("PSH\nPSH\nPSH")[0]
+    cc.extra.update(pc=0, halt=0, wait=0, sp=0)
+    cc.extra["stack"] = []
+    for _ in range(40):
+        cb.cpu_exec(cc)
+    check("cpu halts instead of overrunning its stack", cc.extra["halt"] == 1
+          and "overflow" in cc.extra["err"], cc.extra["err"])
 
     print("-" * 62)
 
@@ -2162,8 +2290,10 @@ class App:
         R.text("CPU PROGRAM", x + 12, y + 9, (170, 232, 200), R.f_mid)
         R.text("ESC assemble+close   F2 demo   F3 clear   ENTER newline   TAB indent",
                x + 160, y + 12, (120, 128, 142), R.f_tiny)
-        R.text("OPS  LDA LDB ADD SUB INC DEC AND ORA XOR SHL SHR CMP JMP JZ JNZ JC "
-               "OUT OFF IN DIN DLY ST LD HLT NOP", x + 12, y + h - 34, (110, 150, 190), R.f_tiny)
+        R.text("OPS  LDA LDB ADD SUB INC DEC AND ORA XOR SHL SHR CMP JMP JZ JNZ JC DLY HLT NOP",
+               x + 12, y + h - 46, (110, 150, 190), R.f_tiny)
+        R.text("     OUT OFF IN DIN   NIB RNIB (4-bit port)   ST LD   PSH POP CALL RET   "
+               "IRQ0-3 label   IRQCLR", x + 12, y + h - 34, (110, 150, 190), R.f_tiny)
         R.text("pins 0=up 1=right 2=down 3=left   A/B are 0-255   labels end with :",
                x + 12, y + h - 20, (100, 108, 122), R.f_tiny)
         if err:
@@ -2414,7 +2544,9 @@ class App:
                  f"A={e.get('a', 0):3d}  B={e.get('b', 0):3d}   Z{e.get('z', 0)} C{e.get('c', 0)}",
                  f"PC {pc:02d} {cur}",
                  f"pins up/rt/dn/lt {dirmark}  out={sum(1 for q in e['pd'] if q == 'out')}",
-                 f"supply {e.get('vcc', 0):.2f} V   cycles {e.get('cycles', 0)}"]
+                 f"supply {e.get('vcc', 0):.2f} V   cycles {e.get('cycles', 0)}",
+                 f"stack {e.get('sp', 0)}/{CPU_STACK}   irq armed "
+                 f"{sum(1 for h in e.get('irq', []) if h >= 0)}   taken {e.get('irqs', 0)}"]
         if not e.get("run") and not e.get("halt"):
             lines.append("! needs >= 2.5 V on any side")
         if e.get("err"):
