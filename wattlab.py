@@ -62,6 +62,15 @@ import math
 import os
 import random
 import sys
+import time
+
+_T_START = time.perf_counter()
+PROFILE = "--profile" in sys.argv
+
+
+def _mark(label):
+    if PROFILE:
+        print(f"[startup] {label}: {(time.perf_counter() - _T_START) * 1000:.0f} ms")
 
 # --------------------------------------------------------------------------
 # configuration
@@ -1215,18 +1224,45 @@ class Renderer:
 # application
 # --------------------------------------------------------------------------
 
+_FONT_PATH = None
+
+
+def _font_path():
+    """Resolve one monospace TTF exactly once.
+
+    pygame.font.SysFont() re-scans the whole system font list on every miss,
+    which is what makes startup crawl on Windows.  We probe a short, platform
+    ordered list a single time and cache the hit.
+    """
+    global _FONT_PATH
+    if _FONT_PATH is not None:
+        return _FONT_PATH
+    import pygame
+    if sys.platform.startswith("win"):
+        cands = ["consolas", "cascadiamono", "couriernew", "lucidaconsole"]
+    elif sys.platform == "darwin":
+        cands = ["menlo", "monaco", "couriernew"]
+    else:
+        cands = ["dejavusansmono", "liberationmono", "couriernew"]
+    for c in cands:
+        try:
+            p = pygame.font.match_font(c)
+        except Exception:
+            p = None
+        if p:
+            _FONT_PATH = p
+            return p
+    _FONT_PATH = ""
+    return ""
+
+
 def _fonts():
     import pygame
-    cands = ["dejavusansmono", "consolas", "liberationmono", "couriernew", "monospace"]
-    path = None
-    for c in cands:
-        path = pygame.font.match_font(c)
-        if path:
-            break
+    path = _font_path()
     def mk(sz):
         if path:
             return pygame.font.Font(path, sz)
-        return pygame.font.SysFont("monospace", sz)
+        return pygame.font.Font(None, sz)   # bundled DejaVu, always present
     return mk(11), mk(12), mk(13), mk(17)
 
 
@@ -1243,11 +1279,17 @@ def _cell_px(x, y):
 class App:
     def __init__(self):
         import pygame
-        pygame.init()
+        # Only the subsystems we actually use.  pygame.init() also starts mixer
+        # and joystick; probing Windows audio devices there costs seconds.
+        pygame.display.init()
+        pygame.font.init()
+        _mark("display + font modules")
         pygame.display.set_caption(APP_TITLE)
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
+        _mark("window created")
         self.clock = pygame.time.Clock()
         self.R = Renderer(self.screen, _fonts())
+        _mark("fonts + renderer")
         self.b = Board()
         self.tool = 0
         self.mat = 0
@@ -1395,6 +1437,17 @@ class App:
             pass
 
     # ---- events ------------------------------------------------------
+    def shift_held(self, e=None):
+        """Some SDL/input paths deliver mouse events with no 'mod' at all, so
+        read the live keyboard state as well instead of trusting the event."""
+        import pygame
+        mod = getattr(e, "mod", 0) if e is not None else 0
+        try:
+            mod |= pygame.key.get_mods()
+        except Exception:
+            pass
+        return bool(mod & (pygame.KMOD_LSHIFT | pygame.KMOD_RSHIFT))
+
     def handle(self, e):
         import pygame
         if e.type == pygame.QUIT:
@@ -1446,17 +1499,20 @@ class App:
             elif k == pygame.K_F9:
                 self.load()
             else:
-                ch = e.unicode.upper() if e.unicode else ""
+                ch = (getattr(e, "unicode", "") or "").upper()
                 for i, (kind, name, key, short) in enumerate(TOOLS):
                     if ch == key:
                         self.tool = i
                         self.status = name
-        if e.type == pygame.MOUSEMOTION or e.type == pygame.MOUSEBUTTONDOWN:
-            mx, my = e.pos
-            self.hover = _world_to_cell(mx, my)
+        if e.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN,
+                      pygame.MOUSEBUTTONUP):
+            pos = getattr(e, "pos", None)
+            if pos is not None:
+                self.hover = _world_to_cell(pos[0], pos[1])
+        btn = getattr(e, "button", 0)
         if e.type == pygame.MOUSEBUTTONDOWN:
-            if e.button == 1:
-                if e.mod & pygame.KMOD_LSHIFT or e.mod & pygame.KMOD_RSHIFT:
+            if btn == 1:
+                if self.shift_held(e):
                     self.dir_anchor = self.hover
                     self.status = "drag to aim, then release"
                 else:
@@ -1464,7 +1520,7 @@ class App:
                     self.last_cell = self.hover
                     if self.inside(self.hover):
                         self.place_at(*self.hover)
-            elif e.button == 3:
+            elif btn == 3:
                 self.painting = True
                 self.last_cell = None
                 if self.inside(self.hover):
@@ -1889,6 +1945,8 @@ class App:
             self.update(min(dt, 0.1))
             self.draw()
             pygame.display.flip()
+            if self.frames == 0:
+                _mark("first frame on screen")
             self.frames += 1
             if max_frames and self.frames >= max_frames:
                 running = False
@@ -1896,7 +1954,12 @@ class App:
 
 
 def run_app(max_frames=None):
-    App().run(max_frames)
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    import pygame
+    _mark("pygame imported")
+    app = App()
+    _mark("app ready")
+    app.run(max_frames)
     return 0
 
 

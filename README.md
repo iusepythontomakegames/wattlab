@@ -16,6 +16,12 @@ Headless physics check (no pygame needed, 21 assertions):
 python3 wattlab.py --selftest
 ```
 
+If it feels slow to appear, this prints how long each startup stage took:
+
+```
+python3 wattlab.py --profile
+```
+
 ## Parts
 
 | Part | Key | Behaviour |
