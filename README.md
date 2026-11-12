@@ -39,6 +39,7 @@ python3 wattlab.py --profile
 | Water | - | Conducts. Puddles short rails, boil off, and dissolve hardware. |
 | Eraser | = | Removes tiles. Drag to sweep. |
 | CPU | ` | A programmable 8-bit chip with four I/O pins. Hover it and press `E`. |
+| Hex Display | F2 | Four inputs, one seven segment hex digit. High impedance, it only watches. |
 
 Tools are numbered along the keyboard's number row, left to right: `1 2 3 4 5 6 7 8 9 0 - =`.
 
@@ -83,6 +84,11 @@ silently corrupting anything.
 A four bit parallel port tooltip on the chip shows stack depth, armed interrupts and how
 many were taken.
 
+Press `F2` for a hex display. It reads its four neighbours as bits (up = bit0, right =
+bit1, down = bit2, left = bit3, anything over 2.5 V counts as 1) and lights that digit,
+so wiring `NIB` into it gives you a live counter you can read at a glance. It draws no
+current, so it never disturbs the circuit it is watching.
+
 ```
 ; blink whatever is wired to the right pin
 loop:
@@ -111,7 +117,8 @@ loop:
 LMB drag   place                RMB          erase
 LMB+SHIFT  aim a part (4 dirs)  R            rotate
 M          wire material        C            custom alloy
-E          edit the CPU under the cursor
+E          edit the CPU under the cursor   P  single step it
+CTRL+Z     undo the last edit
 , . / wheel  adjust hovered source / R / C
 SPACE      pause                F            single step
 [ ]        layer switch         N            new layer

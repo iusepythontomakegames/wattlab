@@ -23,6 +23,8 @@ Parts in the box
  10. WIRE MATERIALS copper/gold/silver/... plus an editable CUSTOM alloy.
  11. CPU            a 4 pin 8-bit register machine you program in the game
                     (key `).  Hover it and press E for the assembler editor.
+ 12. HEX DISPLAY    a seven segment digit driven by its four neighbours.
+                    High impedance, so it only watches the wire it touches.
 
 Two terminal parts (source, resistor, capacitor, LED, bridge) need wire on BOTH
 sides, facing along their arrow.  The panel warns "! needs wire on both ends"
@@ -154,11 +156,13 @@ TOOLS = [
     ("water",  "Water (conducts)", "-", "Water"),
     ("erase",  "Eraser",           "=", "Erase"),
     ("cpu",    "CPU (chip)",       "`", "CPU"),
+    ("dsp",    "Hex Display",      "F2", "Disp"),
 ]
 TOOL_KINDS = [t[0] for t in TOOLS]
 
 KIND_COLOR = {
     "cpu":    (168, 196, 236),
+    "dsp":    (255, 196, 96),
     "src":    (226, 88, 88),
     "cap":    (88, 148, 222),
     "volt":   (238, 214, 116),
@@ -218,6 +222,13 @@ CPU_OPS = ("NOP", "HLT", "LDA", "LDB", "ADD", "SUB", "INC", "DEC", "AND",
            "IRQ0", "IRQ1", "IRQ2", "IRQ3", "IRQCLR")
 CPU_MEM = 32
 CPU_STACK = 16
+DSP_SEGS = {0: "abcdef", 1: "bc", 2: "abged", 3: "abgcd", 4: "fgbc",
+            5: "afgcd", 6: "afgecd", 7: "abc", 8: "abcdefg", 9: "abfgcd",
+            10: "abcefg", 11: "cdefg", 12: "adef", 13: "bcdeg",
+            14: "adefg", 15: "aefg"}
+DSP_RECTS = {"a": (4, 3, 8, 2), "g": (4, 7, 8, 2), "d": (4, 11, 8, 2),
+             "f": (3, 4, 2, 4), "b": (11, 4, 2, 4), "e": (3, 8, 2, 4),
+             "c": (11, 8, 2, 4)}
 CPU_ROUT = 40.0        # output stage impedance in ohm (a real MCU-ish pin)
 CPU_MIN_V = 2.5        # supply needed before it will run
 CPU_LOAD_A = 0.020     # current it pulls from the strongest rail
@@ -393,6 +404,11 @@ class Cell:
             e["rail_n"] = []
             e["rail_e"] = []
             e["i"] = 0.0
+        elif k == "dsp":
+            e["val"] = 0
+            e["bits"] = 0
+            e["vp"] = [0.0, 0.0, 0.0, 0.0]
+            e["cn"] = [-1, -1, -1, -1]
         elif k == "slag":
             e["i"] = 0.0
 
@@ -620,6 +636,15 @@ class Board:
                 i = self.nid.get((li, x, y))
                 if i is not None:
                     self._add_edge(Edge(i, self.gnd, 1.0 / FAN_R, "fan", c))
+
+        # hex displays are high impedance: they only watch their neighbours
+        for li, (x, y), c in self.all_cells():
+            if c.kind != "dsp":
+                continue
+            e = c.extra
+            for d, (dx, dy) in enumerate(DIRV):
+                j = self.nid.get((li, x + dx, y + dy))
+                e["cn"][d] = -1 if j is None else j
 
         # cpu pins: a 40 ohm output stage from a rail node onto the wire
         for li, (x, y), c in self.all_cells():
@@ -1052,6 +1077,20 @@ class Board:
         V = self.V
         nV = len(V)
         for _, _, c in self.all_cells():
+            if c.kind == "dsp":
+                e = c.extra
+                cn = e["cn"]
+                bits = 0
+                for d in range(4):
+                    i = cn[d]
+                    v = V[i] if (i is not None and 0 <= i < nV) else 0.0
+                    e["vp"][d] = v
+                    if v > 2.5:
+                        bits |= 1 << d
+                e["bits"] = bits
+                e["val"] = bits
+                c.v = 0.0
+                continue
             if c.kind != "cpu":
                 continue
             e = c.extra
@@ -1444,6 +1483,39 @@ def selftest():
     check("cpu halts instead of overrunning its stack", cc.extra["halt"] == 1
           and "overflow" in cc.extra["err"], cc.extra["err"])
 
+    db = Board()
+    for (x, y) in [(5, 4), (6, 5), (5, 6), (4, 5)]:
+        db.layers[0].cells[(x, y)] = Cell("wire")
+    db.layers[0].cells[(5, 5)] = Cell("dsp")
+    db.dirty = True
+    db.solve(1 / 30)
+    ds = db.cell(5, 5)
+    for d, (dx, dy) in enumerate(DIRV):
+        j = db.nid.get((0, 5 + dx, 5 + dy))
+        if j is not None:
+            db.V[j] = 5.0 if d % 2 == 0 else 0.0
+    db._cpu_readout()
+    check("hex display decodes four pins", ds.extra["val"] == 5,
+          f"shows {ds.extra['val']:X} for bits 0 and 2")
+
+    db = Board()
+    for (x, y) in [(10, 11), (10, 12), (10, 13), (10, 9), (10, 15)]:
+        db.layers[0].cells[(x, y)] = Cell("wire")
+    db.layers[0].cells[(10, 14)] = Cell("src", d=0)
+    db.cell(10, 14).extra["v"] = 5.0
+    db.layers[0].cells[(10, 10)] = Cell("cpu", d=1)
+    db.layers[0].cells[(10, 8)] = Cell("dsp")
+    db.dirty = True
+    chip = db.cell(10, 10)
+    chip.extra["prog"] = "LDA 255\nNIB\nDLY 99"
+    chip.extra["code"] = cpu_assemble(chip.extra["prog"])[0]
+    chip.extra["hz"] = 30.0
+    for _ in range(60):
+        db.step(1 / 30)
+    dval = db.cell(10, 8).extra["val"]
+    check("cpu drives a hex display through real wire", chip.extra["run"] == 1 and dval == 4,
+          f"run={chip.extra['run']} display {dval:X} (bit 2 comes from below)")
+
     print("-" * 62)
 
     # ---- 1. Ohm's law in a real loop ---------------------------------
@@ -1669,6 +1741,14 @@ class Renderer:
             s.fill((226, 240, 255), (px + 4, py + 3, 2, CELL - 6))
             s.fill((226, 240, 255), (px + CELL - 6, py + 3, 2, CELL - 6))
             s.fill(shade(col, 0.6), (cx - 1, py + 3, 2, CELL - 6))
+        elif k == "dsp":
+            s.fill(shade((26, 30, 38), f), (px, py, CELL, CELL))
+            lit = DSP_SEGS.get(c.extra.get("val", 0), "abcdefg")
+            for bar, (sx, sy, sw, sh) in DSP_RECTS.items():
+                col = (255, 198, 92) if bar in lit else (46, 52, 62)
+                if dim:
+                    col = shade(col, 0.4)
+                s.fill(col, (px + sx, py + sy, sw, sh))
         elif k == "cpu":
             body = (50, 58, 74) if not c.extra.get("halt") else (64, 40, 44)
             s.fill(shade(body, f), (px + 3, py + 3, CELL - 6, CELL - 6))
@@ -1851,6 +1931,7 @@ class App:
         self.ccur = [0, 0]
         self.cscroll = 0
         self.ctempl = 0
+        self.undo = []
         self.def_src = 5.0
         self.def_res = 220.0
         self.def_cap = 470e-6
@@ -2005,6 +2086,37 @@ class App:
             pass
         return bool(mod & (pygame.KMOD_LSHIFT | pygame.KMOD_RSHIFT))
 
+    def ctrl_held(self, e=None):
+        import pygame
+        mod = getattr(e, "mod", 0) if e is not None else 0
+        try:
+            mod |= pygame.key.get_mods()
+        except Exception:
+            pass
+        return bool(mod & (pygame.KMOD_LCTRL | pygame.KMOD_RCTRL))
+
+    def push_undo(self):
+        try:
+            snap = json.dumps(self.b.to_dict())
+        except (TypeError, ValueError):
+            return
+        if self.undo and self.undo[-1] == snap:
+            return
+        self.undo.append(snap)
+        if len(self.undo) > 25:
+            del self.undo[0]
+
+    def undo_pop(self):
+        if not self.undo:
+            self.status = "nothing to undo"
+            return
+        snap = self.undo.pop()
+        try:
+            self.b.load_dict(json.loads(snap))
+            self.status = f"undo  ({len(self.undo)} left)"
+        except (ValueError, KeyError, TypeError):
+            self.status = "undo failed"
+
     def handle(self, e):
         import pygame
         if self.cedit:
@@ -2040,8 +2152,10 @@ class App:
             elif k == pygame.K_c:
                 self.mat_editor = True
             elif k == pygame.K_n:
+                self.push_undo()
                 self.b.add_layer()
             elif k == pygame.K_x:
+                self.push_undo()
                 self.b.layer.cells.clear()
                 self.b.dirty = True
                 self.b.log(f"layer {self.b.cur} cleared")
@@ -2053,6 +2167,21 @@ class App:
                 self.adjust(-1)
             elif k in (pygame.K_PERIOD, pygame.K_RIGHT):
                 self.adjust(1)
+            elif k == pygame.K_z and self.ctrl_held(e):
+                self.undo_pop()
+            elif k == pygame.K_p:
+                c = self.b.layer.cells.get(self.hover) if self.hover else None
+                if c is not None and c.kind == "cpu" and c.extra["code"]:
+                    self.b.cpu_exec(c)
+                    code = c.extra["code"]
+                    nxt = code[c.extra["pc"] % len(code)][0]
+                    self.status = (f"step: A={c.extra['a']} pc={c.extra['pc']} "
+                                   f"next {nxt}")
+                else:
+                    self.status = "hover a CPU with a program, then press P"
+            elif k == pygame.K_F2:
+                self.tool = TOOL_KINDS.index("dsp")
+                self.status = "Hex Display - wire 4 pins, up=bit0 left=bit3"
             elif k == pygame.K_e:
                 self.open_cpu_editor()
             elif k == pygame.K_BACKQUOTE:
@@ -2079,6 +2208,7 @@ class App:
                 self.hover = _world_to_cell(pos[0], pos[1])
         btn = getattr(e, "button", 0)
         if e.type == pygame.MOUSEBUTTONDOWN:
+            self.push_undo()
             if btn == 1:
                 if self.shift_held(e):
                     self.dir_anchor = self.hover
@@ -2179,6 +2309,7 @@ class App:
         if c is None or c.kind != "cpu":
             self.status = "cpu gone, program dropped"
             return
+        self.push_undo()
         txt = "\n".join(self.clines)
         code, err = cpu_assemble(txt)
         c.extra["prog"] = txt
@@ -2352,7 +2483,7 @@ class App:
         R.text("WATT//LAB", 14, 14, (255, 214, 120), R.f_big)
         R.text("pixel electronics sandbox", 132, 20, (110, 118, 132), R.f_tiny)
         x = BOARD_X
-        w = 66
+        w = 62
         for i, (kind, name, key, short) in enumerate(TOOLS):
             sel = (i == self.tool)
             col = (46, 52, 64) if sel else (30, 33, 41)
@@ -2558,6 +2689,14 @@ class App:
         k = c.kind
         if k == "cpu":
             return self.cpu_tip(c)
+        if k == "dsp":
+            e = c.extra
+            vp = e.get("vp", [0.0] * 4)
+            return [f"HEX DISPLAY   {e.get('val', 0):X}",
+                    f"bits {e.get('bits', 0):04b}  (bit0 up, bit3 left)",
+                    f"up {vp[0]:.1f}  rt {vp[1]:.1f}  "
+                    f"dn {vp[2]:.1f}  lt {vp[3]:.1f} V",
+                    ">2.5 V on a side sets that bit"], (255, 214, 120)
         if k == "wire":
             return [f"WIRE {MATERIALS[c.mat]['name']}",
                     f"{c.v:.3f} V   {abs(c.extra.get('i',0))*1000:.2f} mA",
@@ -2646,12 +2785,14 @@ class App:
             ("TOOLS          number row, left to right:", (200, 206, 216)),
             ("               1 wire  2 source  3 capacitor  4 voltmeter", None),
             ("               5 bridge  6 LED  7 resistor  8 heatsink", None),
-            ("               9 fan  0 via  - water  = eraser  ` cpu", None),
+            ("               9 fan  0 via  - water  = eraser  ` cpu  F2 display", None),
             ("", None),
             ("MOUSE          LMB place / drag     RMB erase", (200, 206, 216)),
             ("               LMB + SHIFT + drag = set the 4-way direction", None),
             ("", None),
             ("KEYS           R rotate   M wire material   C custom alloy editor", (200, 206, 216)),
+            ("               E program the CPU under the cursor   P single step it", None),
+            ("               CTRL+Z undo   F2 hex display", None),
             ("               , / . or mouse wheel change source V, ohms, farads", None),
             ("               SPACE pause   F single step   [ ] layers   N new layer", None),
             ("               X clear layer   F5 save   F9 load   ESC quit", None),
