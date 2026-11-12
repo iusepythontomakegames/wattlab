@@ -36,7 +36,10 @@ python3 wattlab.py --profile
 | Heatsink | 8 | Big thermal mass, pulls heat out of whatever it touches. |
 | Fan | 9 | Bulky and the heaviest load in the box (~80 mA). Must touch a powered node; cools heatsinks in a radius. |
 | Via | 0 | Links a tile to the same tile on the layer above. |
-| Water | K | Conducts. Puddles short rails, boil off, and dissolve hardware. |
+| Water | - | Conducts. Puddles short rails, boil off, and dissolve hardware. |
+| Eraser | = | Removes tiles. Drag to sweep. |
+
+Tools are numbered along the keyboard's number row, left to right: `1 2 3 4 5 6 7 8 9 0 - =`.
 
 Wire material: `M` cycles copper, silver, gold, aluminium, brass, steel, tungsten,
 nichrome, carbon and solder. `C` opens an editor for a custom alloy with its own
@@ -54,10 +57,11 @@ resistance, ampacity and thermal conductivity.
 ## Controls
 
 ```
-1-9,0,K    pick tool            LMB drag     place
-RMB        erase                LMB + SHIFT  aim a part (4 directions)
-R          rotate               M            wire material
-C          custom alloy         - / =        adjust hovered source / R / C
+1 2 3 4 5 6 7 8 9 0 - =   pick tool (number row order)
+LMB drag   place                RMB          erase
+LMB+SHIFT  aim a part (4 dirs)  R            rotate
+M          wire material        C            custom alloy
+, . / wheel  adjust hovered source / R / C
 SPACE      pause                F            single step
 [ ]        layer switch         N            new layer
 X          clear layer          F1           help overlay

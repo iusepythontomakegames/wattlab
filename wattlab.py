@@ -43,7 +43,7 @@ Run
 
 Controls
 --------
-    1..9,0,K   pick tool              LMB drag   place
+    1..9,0,-,= pick tool (number row)   LMB drag   place
     RMB        erase                  LMB+SHIFT  drag to aim a 4-way direction
     R          rotate tool            M          cycle wire material
     C          custom alloy editor    SPACE      pause / resume simulation
@@ -136,6 +136,7 @@ MAT_ORDER = tuple(MATERIALS.keys())
 # kinds that behave as electrical nodes
 NODE_KINDS = {"wire", "water", "volt", "fan", "via", "slag"}
 
+# Tool order == number row order: 1 2 3 4 5 6 7 8 9 0 - =
 TOOLS = [
     ("wire",   "Wire",             "1", "Wire"),
     ("src",    "Power Source",     "2", "Source"),
@@ -147,7 +148,8 @@ TOOLS = [
     ("sink",   "Heatsink",         "8", "Sink"),
     ("fan",    "Fan",              "9", "Fan"),
     ("via",    "Via (layer link)", "0", "Via"),
-    ("water",  "Water (conducts)", "K", "Water"),
+    ("water",  "Water (conducts)", "-", "Water"),
+    ("erase",  "Eraser",           "=", "Erase"),
 ]
 TOOL_KINDS = [t[0] for t in TOOLS]
 
@@ -1354,6 +1356,9 @@ class App:
         L = self.b.layer
         if not (0 <= x < L.w and 0 <= y < L.h):
             return
+        if kind == "erase":
+            self.erase_at(x, y)
+            return
         old = L.cells.get((x, y))
         if old is not None and old.kind == kind and kind in ("wire", "water"):
             return
@@ -1490,9 +1495,9 @@ class App:
                 self.b.cur = max(0, self.b.cur - 1)
             elif k == pygame.K_RIGHTBRACKET:
                 self.b.cur = min(len(self.b.layers) - 1, self.b.cur + 1)
-            elif k in (pygame.K_MINUS, pygame.K_KP_MINUS):
+            elif k in (pygame.K_COMMA, pygame.K_LEFT):
                 self.adjust(-1)
-            elif k in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+            elif k in (pygame.K_PERIOD, pygame.K_RIGHT):
                 self.adjust(1)
             elif k == pygame.K_F5:
                 self.save()
@@ -1504,6 +1509,10 @@ class App:
                     if ch == key:
                         self.tool = i
                         self.status = name
+        if e.type == pygame.MOUSEWHEEL:
+            if getattr(e, "y", 0):
+                self.adjust(1 if e.y > 0 else -1)
+            return True
         if e.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN,
                       pygame.MOUSEBUTTONUP):
             pos = getattr(e, "pos", None)
@@ -1623,7 +1632,7 @@ class App:
         R.text("WATT//LAB", 14, 14, (255, 214, 120), R.f_big)
         R.text("pixel electronics sandbox", 132, 20, (110, 118, 132), R.f_tiny)
         x = BOARD_X
-        w = 78
+        w = 72
         for i, (kind, name, key, short) in enumerate(TOOLS):
             sel = (i == self.tool)
             col = (46, 52, 64) if sel else (30, 33, 41)
@@ -1670,6 +1679,14 @@ class App:
         # preview
         if self.inside(self.hover) and not self.mat_editor:
             px, py = _cell_px(*self.hover)
+            if self.cur_kind() == "erase":
+                s.fill((86, 30, 34), (px, py, CELL, CELL))
+                pygame.draw.rect(s, (255, 120, 120), (px, py, CELL, CELL), 1)
+                pygame.draw.line(s, (255, 150, 150), (px + 4, py + 4),
+                                 (px + CELL - 5, py + CELL - 5))
+                pygame.draw.line(s, (255, 150, 150), (px + CELL - 5, py + 4),
+                                 (px + 4, py + CELL - 5))
+                return
             ghost = self.make_cell(self.cur_kind())
             ghost.temp = AMBIENT
             R.cell(px, py, ghost, dim=True)
@@ -1865,7 +1882,7 @@ class App:
         s = self.screen
         s.fill((20, 22, 28), (0, BAR_Y + 4, WIN_W, WIN_H - BAR_Y))
         hints = ("LMB place   RMB erase   LMB+SHIFT aim (4 dirs)   R rotate   M material   "
-                 "C custom alloy   1-9,0,K tools   - = value   SPACE pause   F1 help")
+                 "C custom alloy   tools 1-0,-,=   , . / wheel value   SPACE pause   F1 help")
         R.text(hints, 12, BAR_Y + 10, (128, 136, 150), R.f_tiny)
         R.text("WATT//LAB v1.0  -  physics is the game", 12, BAR_Y + 26, (70, 76, 88), R.f_tiny)
 
@@ -1880,15 +1897,16 @@ class App:
         lines = [
             ("WATT//LAB HELP  (F1 to close)", (255, 214, 120)),
             ("", None),
-            ("TOOLS          1 wire   2 source   3 capacitor   4 voltmeter", (200, 206, 216)),
-            ("               5 one-way bridge   6 LED   7 resistor", None),
-            ("               8 heatsink   9 fan   0 via   K water", None),
+            ("TOOLS          number row, left to right:", (200, 206, 216)),
+            ("               1 wire  2 source  3 capacitor  4 voltmeter", None),
+            ("               5 bridge  6 LED  7 resistor  8 heatsink", None),
+            ("               9 fan  0 via  - water  = eraser", None),
             ("", None),
             ("MOUSE          LMB place / drag     RMB erase", (200, 206, 216)),
             ("               LMB + SHIFT + drag = set the 4-way direction", None),
             ("", None),
             ("KEYS           R rotate   M wire material   C custom alloy editor", (200, 206, 216)),
-            ("               - / = change source volts, resistance, capacitance", None),
+            ("               , / . or mouse wheel change source V, ohms, farads", None),
             ("               SPACE pause   F single step   [ ] layers   N new layer", None),
             ("               X clear layer   F5 save   F9 load   ESC quit", None),
             ("", None),
