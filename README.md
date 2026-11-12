@@ -38,12 +38,51 @@ python3 wattlab.py --profile
 | Via | 0 | Links a tile to the same tile on the layer above. |
 | Water | - | Conducts. Puddles short rails, boil off, and dissolve hardware. |
 | Eraser | = | Removes tiles. Drag to sweep. |
+| CPU | ` | A programmable 8-bit chip with four I/O pins. Hover it and press `E`. |
 
 Tools are numbered along the keyboard's number row, left to right: `1 2 3 4 5 6 7 8 9 0 - =`.
 
 Wire material: `M` cycles copper, silver, gold, aluminium, brass, steel, tungsten,
 nichrome, carbon and solder. `C` opens an editor for a custom alloy with its own
 resistance, ampacity and thermal conductivity.
+
+## The CPU
+
+`` ` `` drops a chip. Hover it and press `E` for the program editor (`F2` demo, `F3`
+clear the buffer, `ESC` assembles and closes). Errors are reported with the line
+number in red, and the tooltip shows the program counter, registers and pin states.
+
+Four pins: `0` up, `1` right, `2` down, `3` left. The chip powers itself from any
+adjacent wire at 2.5 V or more (about 20 mA), and each pin is a real 40 ohm push
+stage that drives 0 to Vcc onto the wire, so loading it with a resistor and LED
+makes it sag exactly like a microcontroller pin would. High-Z (`OFF`) is 1 MOhm.
+
+One instruction runs per clock tick; the clock is set per chip with `,` / `.` from
+0.5 Hz up to 60 Hz, so you can watch a program walk through the board.
+
+Registers: `A`, `B`, 32 bytes of RAM, flags `Z` and `C`. `HLT` stops the chip until
+you re-assemble. Labels are `name:` at the start of a line, comments start with `;`,
+operands accept `123` or `0x7B`.
+
+| Group | Ops |
+| --- | --- |
+| Load / store | `LDA n` `LDB n` `ST n` `LD n` |
+| Maths | `ADD n` `SUB n` `INC` `DEC` |
+| Logic | `AND n` `ORA n` `XOR n` `SHL` `SHR` `CMP n` |
+| Flow | `JMP label` `JZ label` `JNZ label` `JC label` `DLY n` `HLT` `NOP` |
+| Pins | `OUT p` (drive pin p with A) `OFF p` (high-Z) `IN p` (analog 0-255) `DIN p` (digital) |
+
+```
+; blink whatever is wired to the right pin
+loop:
+  LDA 255
+  OUT 1
+  DLY 6
+  LDA 0
+  OUT 1
+  DLY 6
+  JMP loop
+```
 
 ## Rules the sim actually enforces
 
@@ -57,10 +96,11 @@ resistance, ampacity and thermal conductivity.
 ## Controls
 
 ```
-1 2 3 4 5 6 7 8 9 0 - =   pick tool (number row order)
+1 2 3 4 5 6 7 8 9 0 - = `  pick tool (number row order, ` = CPU)
 LMB drag   place                RMB          erase
 LMB+SHIFT  aim a part (4 dirs)  R            rotate
 M          wire material        C            custom alloy
+E          edit the CPU under the cursor
 , . / wheel  adjust hovered source / R / C
 SPACE      pause                F            single step
 [ ]        layer switch         N            new layer

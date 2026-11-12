@@ -21,6 +21,8 @@ Parts in the box
                     then it dumps ~80 mA to the 0 V rail and blows air over
                     nearby heatsinks.
  10. WIRE MATERIALS copper/gold/silver/... plus an editable CUSTOM alloy.
+ 11. CPU            a 4 pin 8-bit register machine you program in the game
+                    (key `).  Hover it and press E for the assembler editor.
 
 Two terminal parts (source, resistor, capacitor, LED, bridge) need wire on BOTH
 sides, facing along their arrow.  The panel warns "! needs wire on both ends"
@@ -44,6 +46,7 @@ Run
 Controls
 --------
     1..9,0,-,= pick tool (number row)   LMB drag   place
+    `          put a CPU down          E          edit its program
     RMB        erase                  LMB+SHIFT  drag to aim a 4-way direction
     R          rotate tool            M          cycle wire material
     C          custom alloy editor    SPACE      pause / resume simulation
@@ -150,10 +153,12 @@ TOOLS = [
     ("via",    "Via (layer link)", "0", "Via"),
     ("water",  "Water (conducts)", "-", "Water"),
     ("erase",  "Eraser",           "=", "Erase"),
+    ("cpu",    "CPU (chip)",       "`", "CPU"),
 ]
 TOOL_KINDS = [t[0] for t in TOOLS]
 
 KIND_COLOR = {
+    "cpu":    (168, 196, 236),
     "src":    (226, 88, 88),
     "cap":    (88, 148, 222),
     "volt":   (238, 214, 116),
@@ -201,6 +206,95 @@ def mat_melt(cell):
 # --------------------------------------------------------------------------
 # cells
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# the CPU: a tiny 8-bit register machine you wire into the board
+# --------------------------------------------------------------------------
+
+CPU_OPS = ("NOP", "HLT", "LDA", "LDB", "ADD", "SUB", "INC", "DEC", "AND",
+           "ORA", "XOR", "SHL", "SHR", "CMP", "JMP", "JZ", "JNZ", "JC",
+           "OUT", "OFF", "IN", "DIN", "DLY", "ST", "LD")
+CPU_MEM = 32
+CPU_ROUT = 40.0        # output stage impedance in ohm (a real MCU-ish pin)
+CPU_MIN_V = 2.5        # supply needed before it will run
+CPU_LOAD_A = 0.020     # current it pulls from the strongest rail
+CPU_HZ_DEF = 4.0
+
+CPU_DEMO = '''; blink the right pin
+loop:
+  LDA 255
+  OUT 1
+  DLY 6
+  LDA 0
+  OUT 1
+  DLY 6
+  JMP loop
+'''
+
+CPU_DEMO2 = '''; knight rider - chase a lit pin around the chip
+loop:
+  LDA 255
+  OUT 1
+  DLY 3
+  LDA 0
+  OUT 1
+  LDA 255
+  OUT 2
+  DLY 3
+  LDA 0
+  OUT 2
+  LDA 255
+  OUT 3
+  DLY 3
+  LDA 0
+  OUT 3
+  LDA 255
+  OUT 0
+  DLY 3
+  LDA 0
+  OUT 0
+  JMP loop
+'''
+
+CPU_TEMPLATES = (CPU_DEMO, CPU_DEMO2)
+
+
+def cpu_assemble(text):
+    """Two pass assembler: strip comments, collect labels, resolve operands."""
+    labels = {}
+    ins = []
+    for raw in text.split("\n"):
+        s = raw.split(";")[0].strip()
+        while ":" in s:
+            lab, rest = s.split(":", 1)
+            lab = lab.strip()
+            if not lab or " " in lab or lab.upper() in CPU_OPS:
+                break
+            labels[lab.upper()] = len(ins)
+            s = rest.strip()
+        if not s:
+            continue
+        bits = s.split()
+        ins.append((bits[0].upper(), bits[1] if len(bits) > 1 else None))
+    code = []
+    for n, (op, arg) in enumerate(ins):
+        if op not in CPU_OPS:
+            return [], "line %d: unknown op %r" % (n + 1, op)
+        val = 0
+        if arg is not None:
+            try:
+                val = int(arg, 0)
+            except ValueError:
+                key = arg.upper()
+                if key in labels:
+                    val = labels[key]
+                elif op in ("JMP", "JZ", "JNZ", "JC"):
+                    return [], "line %d: no label %r" % (n + 1, arg)
+                else:
+                    return [], "line %d: bad operand %r" % (n + 1, arg)
+        code.append((op, val))
+    return code, ""
+
 
 class Cell:
     __slots__ = ("kind", "mat", "d", "temp", "v", "pw", "extra")
@@ -256,6 +350,30 @@ class Cell:
             e["stress"] = 0.0
             e["i"] = 0.0
         elif k in ("volt", "via"):
+            e["i"] = 0.0
+        elif k == "cpu":
+            e["hz"] = CPU_HZ_DEF
+            e["prog"] = CPU_DEMO
+            e["code"] = []
+            e["err"] = ""
+            e["pc"] = 0
+            e["a"] = 0
+            e["b"] = 0
+            e["z"] = 1
+            e["c"] = 0
+            e["acc"] = 0.0
+            e["cycles"] = 0
+            e["wait"] = 0
+            e["halt"] = 0
+            e["run"] = 0
+            e["vcc"] = 0.0
+            e["vp"] = [0.0, 0.0, 0.0, 0.0]
+            e["lv"] = [0, 0, 0, 0]
+            e["pd"] = ["in", "in", "in", "in"]
+            e["mem"] = [0] * CPU_MEM
+            e["cn"] = []
+            e["rail_n"] = []
+            e["rail_e"] = []
             e["i"] = 0.0
         elif k == "slag":
             e["i"] = 0.0
@@ -386,7 +504,19 @@ class Board:
                     self.nid[(L.idx, pos[0], pos[1])] = len(self.nodes)
                     self.nodes.append((L.idx, pos[0], pos[1], c))
         self.gnd = len(self.nodes)
-        n = len(self.nodes) + 1
+        # every cpu pin gets a fixed "rail" node.  They are allocated once so
+        # flipping a pin between driving and high-Z never reshapes the graph.
+        rail_base = len(self.nodes) + 1
+        nrail = 0
+        for L in self.layers:
+            for pos, c in L.cells.items():
+                if c.kind == "cpu":
+                    c.extra["rail_n"] = [rail_base + nrail + d for d in range(4)]
+                    c.extra["rail_e"] = [-1, -1, -1, -1]
+                    c.extra["cn"] = [-1, -1, -1, -1]
+                    nrail += 4
+        self.n_rails = nrail
+        n = rail_base + nrail
         self.edges = []
         self.adj = [[] for _ in range(n)]
         self.fixed = {}
@@ -473,6 +603,28 @@ class Board:
                 if i is not None:
                     self._add_edge(Edge(i, self.gnd, 1.0 / FAN_R, "fan", c))
 
+        # cpu pins: a 40 ohm output stage from a rail node onto the wire
+        for li, (x, y), c in self.all_cells():
+            if c.kind != "cpu":
+                continue
+            e = c.extra
+            for d, (dx, dy) in enumerate(DIRV):
+                rn = e["rail_n"][d]
+                self.fixed[rn] = 0.0
+                j = self.nid.get((li, x + dx, y + dy))
+                if j is None:
+                    e["cn"][d] = -1
+                    e["rail_e"][d] = -1
+                else:
+                    e["cn"][d] = j
+                    e["rail_e"][d] = len(self.edges)
+                    self._add_edge(Edge(j, rn, 1e-6, "cpupin", c))
+            new_code, new_err = cpu_assemble(e.get("prog", ""))
+            if new_code != e["code"]:
+                e["code"], e["err"] = new_code, new_err
+                e["pc"] = 0
+                e["wait"] = 0
+
         self.V = [0.0] * n
         if self.fixed:
             avg = sum(self.fixed.values()) / len(self.fixed)
@@ -480,6 +632,10 @@ class Board:
             avg = 0.0
         for i in range(len(self.nodes)):
             self.V[i] = avg
+        for i in range(len(self.nodes)):
+            if self.nodes[i][3].kind not in ("wire", "water", "via", "volt",
+                                             "fan", "slag"):
+                self.V[i] = 0.0
         self.V[self.gnd] = 0.0
 
     def _add_edge(self, e: Edge):
@@ -495,7 +651,7 @@ class Board:
         if self.dirty or not self.nodes:
             self._build()
             self.dirty = False
-        n = len(self.nodes)
+        n = len(self.nodes) + getattr(self, "n_rails", 0)
         if len(self.V) != n + 1:
             self.V = [0.0] * (n + 1)
         V = self.V
@@ -549,6 +705,7 @@ class Board:
                     else:
                         e.g = G_OFF
 
+            self._cpu_drive()
             for i, val in fixed.items():
                 V[i] = val
             V[gnd] = 0.0
@@ -595,6 +752,7 @@ class Board:
             if not changed:
                 break
         self.iters_used = total_iters
+        self._cpu_readout()
 
         # 4. currents, power, per-cell readouts
         for e in edges:
@@ -829,8 +987,171 @@ class Board:
                 self.log("thermal expansion cracked a wire joint (+45% resistance)")
 
     # ---- one simulation step ----------------------------------------
+    def _cpu_drive(self):
+        """Push pin levels into the graph and pull the chip's supply current."""
+        V = self.V
+        nV = len(V)
+        fixed = self.fixed
+        edges = self.edges
+        inj = self.inj
+        for _, _, c in self.all_cells():
+            if c.kind != "cpu":
+                continue
+            e = c.extra
+            pd = e["pd"]
+            lv = e["lv"]
+            cn = e["cn"]
+            rail_n = e["rail_n"]
+            rail_e = e["rail_e"]
+            best_i, best_v = -1, 0.0
+            for d in range(4):
+                i = cn[d]
+                if i is not None and 0 <= i < nV:
+                    v = V[i]
+                    if v < 0.0:
+                        v = -v
+                    if v > best_v:
+                        best_v, best_i = v, i
+            e["vcc"] = best_v
+            run = best_v >= CPU_MIN_V and not e.get("halt")
+            e["run"] = 1 if run else 0
+            vcc = best_v if best_v > 0.5 else 5.0
+            for d in range(4):
+                ei = rail_e[d]
+                if ei is None or ei < 0:
+                    continue
+                if run and pd[d] == "out":
+                    edges[ei].g = 1.0 / CPU_ROUT
+                    fixed[rail_n[d]] = (lv[d] / 255.0) * vcc
+                else:
+                    edges[ei].g = 1e-6          # high-Z input
+                    fixed[rail_n[d]] = 0.0
+            if run and best_i >= 0 and best_v > 0.5:
+                g = CPU_LOAD_A / best_v
+                inj[best_i] -= g * best_v
+
+    def _cpu_readout(self):
+        V = self.V
+        nV = len(V)
+        for _, _, c in self.all_cells():
+            if c.kind != "cpu":
+                continue
+            e = c.extra
+            cn = e["cn"]
+            for d in range(4):
+                i = cn[d]
+                e["vp"][d] = V[i] if (i is not None and 0 <= i < nV) else 0.0
+            c.v = e["vcc"]
+            c.pw += 0.02 if e["run"] else 0.0
+
+    def cpu_tick(self, dt):
+        for _, _, c in self.all_cells():
+            if c.kind != "cpu":
+                continue
+            e = c.extra
+            if not e["code"] and e.get("prog"):
+                e["code"], e["err"] = cpu_assemble(e["prog"])
+            if not e["run"] or e["halt"] or not e["code"]:
+                continue
+            e["acc"] += dt * max(0.1, e["hz"])
+            guard = 0
+            while e["acc"] >= 1.0 and guard < 48:
+                e["acc"] -= 1.0
+                guard += 1
+                self.cpu_exec(c)
+
+    def cpu_exec(self, c):
+        """Run one instruction.  Jumps set the program counter directly."""
+        e = c.extra
+        code = e["code"]
+        if not code or e["halt"]:
+            return
+        if e["wait"] > 0:
+            e["wait"] -= 1
+            return
+        pc = e["pc"] % len(code)
+        op, arg = code[pc]
+        e["pc"] = (pc + 1) % len(code)
+        e["cycles"] += 1
+        A = e["a"]
+        B = e["b"]
+        C = e["c"]
+        a = arg & 0xFF
+        if op == "NOP":
+            pass
+        elif op == "HLT":
+            e["halt"] = 1
+        elif op == "LDA":
+            A = a
+        elif op == "LDB":
+            B = a
+        elif op == "ADD":
+            t = A + a
+            C = 1 if t > 255 else 0
+            A = t & 0xFF
+        elif op == "SUB":
+            t = A - a
+            C = 1 if t < 0 else 0
+            A = t & 0xFF
+        elif op == "INC":
+            A = (A + 1) & 0xFF
+        elif op == "DEC":
+            A = (A - 1) & 0xFF
+        elif op == "AND":
+            A = A & a
+        elif op == "ORA":
+            A = A | a
+        elif op == "XOR":
+            A = A ^ a
+        elif op == "SHL":
+            C = 1 if A & 0x80 else 0
+            A = (A << 1) & 0xFF
+        elif op == "SHR":
+            A = A >> 1
+        elif op == "CMP":
+            C = 1 if A < a else 0
+            Z = 1 if A == a else 0
+            e["z"] = Z
+        elif op == "JMP":
+            e["pc"] = a % len(code)
+        elif op == "JZ":
+            if e["z"]:
+                e["pc"] = a % len(code)
+        elif op == "JNZ":
+            if not e["z"]:
+                e["pc"] = a % len(code)
+        elif op == "JC":
+            if C:
+                e["pc"] = a % len(code)
+        elif op == "OUT":
+            d = a & 3
+            e["pd"][d] = "out"
+            e["lv"][d] = A
+        elif op == "OFF":
+            e["pd"][a & 3] = "in"
+        elif op == "IN":
+            v = e["vp"][a & 3]
+            ref = e["vcc"] if e["vcc"] > 0.5 else 5.0
+            A = int(max(0.0, min(1.0, v / ref)) * 255)
+        elif op == "DIN":
+            ref = e["vcc"] if e["vcc"] > 0.5 else 5.0
+            A = 255 if e["vp"][a & 3] > ref * 0.5 else 0
+        elif op == "DLY":
+            e["wait"] = max(1, a)
+        elif op == "ST":
+            e["mem"][a % CPU_MEM] = A
+        elif op == "LD":
+            A = e["mem"][a % CPU_MEM]
+        e["a"] = A & 0xFF
+        e["b"] = B & 0xFF
+        e["c"] = C
+        if op in ("LDA", "LDB", "ADD", "SUB", "INC", "DEC", "AND", "ORA",
+                  "XOR", "SHL", "SHR", "IN", "DIN", "LD"):
+            e["z"] = 1 if e["a"] == 0 else 0
+
     def step(self, dt, do_solve=True):
         self.t += dt
+        self.cpu_tick(dt)
         if do_solve:
             for _, _, c in self.all_cells():
                 if c.kind in ("wire", "water", "via", "volt", "slag"):
@@ -933,6 +1254,68 @@ def selftest():
             ok = False
 
     print("WATT//LAB physics self test")
+    # ---- cpu ---------------------------------------------------------
+    cb = Board()
+    cc = Cell("cpu")
+    cc.extra["code"], cc.extra["err"] = cpu_assemble(
+        "LDA 0\nloop:\nINC\nCMP 5\nJNZ loop\nHLT")
+    for _ in range(24):
+        cb.cpu_exec(cc)
+    check("cpu assembles labels and loops", cc.extra["a"] == 5 and cc.extra["halt"] == 1,
+          f"A={cc.extra['a']} halted={cc.extra['halt']}")
+    check("cpu rejects bad mnemonics", cpu_assemble("FROB 1")[1] != "")
+    cc.extra["code"] = cpu_assemble("LDA 200\nST 3\nLDA 0\nLD 3\nHLT")[0]
+    cc.extra.update(pc=0, halt=0, wait=0)
+    for _ in range(10):
+        cb.cpu_exec(cc)
+    check("cpu ram round trip", cc.extra["a"] == 200, f"A={cc.extra['a']}")
+
+    cb = Board()
+    wires = ([(12, 25), (12, 24), (12, 23), (12, 22)] + [(12, 20), (12, 19), (12, 18),
+             (12, 16), (12, 14), (12, 13)] + [(x, 13) for x in range(13, 17)] +
+             [(16, y) for y in range(14, 28)] + [(x, 27) for x in range(15, 11, -1)])
+    for (x, y) in wires:
+        cb.layers[0].cells[(x, y)] = Cell("wire")
+    cb.layers[0].cells[(12, 26)] = Cell("src", d=0)
+    cb.cell(12, 26).extra["v"] = 5.0
+    cb.layers[0].cells[(12, 21)] = Cell("cpu", d=1)
+    cb.layers[0].cells[(12, 17)] = Cell("res", d=0)
+    cb.layers[0].cells[(12, 15)] = Cell("led", d=0)
+    cb.dirty = True
+    cpu = cb.cell(12, 21)
+    cpu.extra["prog"] = "LDA 200\nOUT 0\nDLY 99"
+    cpu.extra["code"] = cpu_assemble(cpu.extra["prog"])[0]
+    cpu.extra["hz"] = 30.0
+    for _ in range(90):
+        cb.step(1 / 30)
+    check("cpu powers itself from the rail it sits on", cpu.extra["run"] == 1,
+          f"supply {cpu.extra['vcc']:.2f} V")
+    vpin = cb.cell(12, 20).v
+    check("cpu pin drives a real voltage onto wire", 3.3 < vpin < 4.0,
+          f"{vpin:.2f} V for 200/255")
+    led = cb.cell(12, 15)
+    check("cpu output lights an led through a resistor", led.extra["bright"] > 0,
+          f"{led.extra['i'] * 1000:.1f} mA, light {led.extra['bright']}/15")
+    cpu.extra["prog"] = "IN 0\nHLT"
+    cpu.extra["code"] = cpu_assemble(cpu.extra["prog"])[0]
+    cpu.extra.update(pc=0, halt=0, wait=0, acc=0.0)
+    for _ in range(30):
+        cb.step(1 / 30)
+    check("cpu reads an analog level back in", 150 < cpu.extra["a"] < 230,
+          f"A={cpu.extra['a']} from {vpin:.2f} V")
+    cpu.extra["prog"] = "LDA 0\nOUT 0\nDLY 99"
+    cpu.extra["code"] = cpu_assemble(cpu.extra["prog"])[0]
+    cpu.extra.update(pc=0, halt=0, wait=0, acc=0.0)
+    for _ in range(60):
+        cb.step(1 / 30)
+    check("cpu drives low on command", abs(cb.cell(12, 20).v) < 0.1
+          and cb.cell(12, 15).extra["bright"] == 0, f"V={cb.cell(12, 20).v:.3f}")
+    cb.layers[0].cells.pop((12, 22))
+    cb.dirty = True
+    for _ in range(30):
+        cb.step(1 / 30)
+    check("cpu stops when its supply is pulled", cpu.extra["run"] == 0)
+
     print("-" * 62)
 
     # ---- 1. Ohm's law in a real loop ---------------------------------
@@ -1158,6 +1541,34 @@ class Renderer:
             s.fill((226, 240, 255), (px + 4, py + 3, 2, CELL - 6))
             s.fill((226, 240, 255), (px + CELL - 6, py + 3, 2, CELL - 6))
             s.fill(shade(col, 0.6), (cx - 1, py + 3, 2, CELL - 6))
+        elif k == "cpu":
+            body = (50, 58, 74) if not c.extra.get("halt") else (64, 40, 44)
+            s.fill(shade(body, f), (px + 3, py + 3, CELL - 6, CELL - 6))
+            run = c.extra.get("run", 0)
+            lv = c.extra.get("lv", [0, 0, 0, 0])
+            pd = c.extra.get("pd", ["in"] * 4)
+            for d, (dx, dy) in enumerate(DIRV):
+                if pd[d] == "out" and run:
+                    lvl = lv[d] / 255.0
+                    pc = mix((30, 70, 90), (140, 255, 230), lvl)
+                else:
+                    pc = (68, 78, 96)
+                if dx < 0:
+                    s.fill(pc, (px, cy - 1, 3, 3))
+                elif dx > 0:
+                    s.fill(pc, (px + CELL - 3, cy - 1, 3, 3))
+                elif dy < 0:
+                    s.fill(pc, (cx - 1, py, 3, 3))
+                else:
+                    s.fill(pc, (cx - 1, py + CELL - 3, 3, 3))
+            if c.extra.get("halt"):
+                die = (232, 116, 116)
+            elif run:
+                die = (110, 232, 176)
+            else:
+                die = (72, 80, 96)
+            s.fill(shade(die, f), (px + 6, py + 6, 4, 4))
+            s.fill(shade((30, 34, 42), f), (px + 3, py + 3, 2, 2))
         elif k == "volt":
             s.fill((40, 36, 20), (px + 3, py + 3, CELL - 6, CELL - 6))
             s.fill((255, 240, 170), (px + 5, py + 5, 2, 6))
@@ -1306,6 +1717,12 @@ class App:
         self.mat_editor = False
         self.mat_field = 0
         self.help = False
+        self.cedit = False
+        self.cpos = None
+        self.clines = []
+        self.ccur = [0, 0]
+        self.cscroll = 0
+        self.ctempl = 0
         self.def_src = 5.0
         self.def_res = 220.0
         self.def_cap = 470e-6
@@ -1364,6 +1781,8 @@ class App:
             return
         L.cells[(x, y)] = self.make_cell(kind)
         self.b.dirty = True
+        if kind == "cpu":
+            self.status = "CPU placed - hover it and press E to program it"
 
     def erase_at(self, x, y):
         L = self.b.layer
@@ -1438,6 +1857,11 @@ class App:
         elif k == "cap":
             c.extra["c"] = min(1.0, max(1e-6, c.extra["c"] * (2.0 if delta > 0 else 0.5)))
             self.status = f"capacitor set to {c.extra['c']*1e6:.0f} uF"
+        elif k == "cpu":
+            e = c.extra
+            step_hz = max(0.5, e["hz"] * 0.25)
+            e["hz"] = min(60.0, max(0.5, e["hz"] + (step_hz if delta > 0 else -step_hz)))
+            self.status = f"cpu clock {e['hz']:.1f} Hz"
         elif k == "led":
             pass
 
@@ -1455,6 +1879,8 @@ class App:
 
     def handle(self, e):
         import pygame
+        if self.cedit:
+            return self.cedit_key(e)
         if e.type == pygame.QUIT:
             return False
         if e.type == pygame.KEYDOWN:
@@ -1499,6 +1925,11 @@ class App:
                 self.adjust(-1)
             elif k in (pygame.K_PERIOD, pygame.K_RIGHT):
                 self.adjust(1)
+            elif k == pygame.K_e:
+                self.open_cpu_editor()
+            elif k == pygame.K_BACKQUOTE:
+                self.tool = TOOL_KINDS.index("cpu")
+                self.status = "CPU (chip) - place it, then press E to program"
             elif k == pygame.K_F5:
                 self.save()
             elif k == pygame.K_F9:
@@ -1595,6 +2026,163 @@ class App:
         except (OSError, ValueError, KeyError) as ex:
             self.status = f"load failed: {ex}"
 
+
+    # ---- cpu program editor -----------------------------------------
+    def open_cpu_editor(self):
+        c = self.b.layer.cells.get(self.hover) if self.hover else None
+        if c is None or c.kind != "cpu":
+            self.status = "hover a CPU tile, then press E"
+            return
+        self.cedit = True
+        self.cpos = (self.b.cur, self.hover[0], self.hover[1])
+        txt = c.extra.get("prog") or CPU_DEMO
+        self.clines = txt.replace("\r", "").split("\n")
+        self.ccur = [len(self.clines) - 1, len(self.clines[-1])]
+        self.cscroll = 0
+        self.status = "ESC assembles and closes   F2 loads a demo"
+
+    def commit_cpu(self):
+        self.cedit = False
+        if not self.cpos:
+            return
+        li, x, y = self.cpos
+        L = self.b.layers[li] if li < len(self.b.layers) else None
+        c = L.cells.get((x, y)) if L else None
+        if c is None or c.kind != "cpu":
+            self.status = "cpu gone, program dropped"
+            return
+        txt = "\n".join(self.clines)
+        code, err = cpu_assemble(txt)
+        c.extra["prog"] = txt
+        c.extra["code"] = code
+        c.extra["err"] = err
+        c.extra["pc"] = 0
+        c.extra["wait"] = 0
+        c.extra["halt"] = 0
+        c.extra["acc"] = 0.0
+        c.extra["a"] = 0
+        c.extra["b"] = 0
+        c.extra["pd"] = ["in", "in", "in", "in"]
+        if err:
+            self.status = "assemble error: " + err
+            self.b.log("cpu assemble error: " + err)
+        else:
+            self.status = f"assembled {len(code)} instructions"
+            self.b.log(f"cpu programmed: {len(code)} instructions")
+        self.b.dirty = True
+
+    def cedit_key(self, e):
+        import pygame
+        if e.type == pygame.QUIT:
+            return False
+        if e.type != pygame.KEYDOWN:
+            return True
+        k = getattr(e, "key", 0)
+        ln, col = self.ccur
+        line = self.clines[ln] if 0 <= ln < len(self.clines) else ""
+        if k == pygame.K_ESCAPE:
+            self.commit_cpu()
+            return True
+        if k == pygame.K_RETURN or k == pygame.K_KP_ENTER:
+            self.clines[ln:ln + 1] = [line[:col], line[col:]]
+            self.ccur = [ln + 1, 0]
+        elif k == pygame.K_BACKSPACE:
+            if col > 0:
+                self.clines[ln] = line[:col - 1] + line[col:]
+                self.ccur = [ln, col - 1]
+            elif ln > 0:
+                prev = self.clines[ln - 1]
+                self.clines[ln - 1:ln + 1] = [prev + line]
+                self.ccur = [ln - 1, len(prev)]
+        elif k == pygame.K_DELETE:
+            if col < len(line):
+                self.clines[ln] = line[:col] + line[col + 1:]
+            elif ln + 1 < len(self.clines):
+                self.clines[ln:ln + 2] = [line + self.clines[ln + 1]]
+        elif k == pygame.K_TAB:
+            self.clines[ln] = line[:col] + "  " + line[col:]
+            self.ccur = [ln, col + 2]
+        elif k == pygame.K_LEFT:
+            if col > 0:
+                self.ccur = [ln, col - 1]
+            elif ln > 0:
+                self.ccur = [ln - 1, len(self.clines[ln - 1])]
+        elif k == pygame.K_RIGHT:
+            if col < len(line):
+                self.ccur = [ln, col + 1]
+            elif ln + 1 < len(self.clines):
+                self.ccur = [ln + 1, 0]
+        elif k == pygame.K_UP:
+            self.ccur = [max(0, ln - 1), min(col, len(self.clines[max(0, ln - 1)]))]
+        elif k == pygame.K_DOWN:
+            nl = min(len(self.clines) - 1, ln + 1)
+            self.ccur = [nl, min(col, len(self.clines[nl]))]
+        elif k == pygame.K_HOME:
+            self.ccur = [ln, 0]
+        elif k == pygame.K_END:
+            self.ccur = [ln, len(line)]
+        elif k == pygame.K_F3:
+            self.clines = [""]
+            self.ccur = [0, 0]
+            self.cscroll = 0
+            self.status = "buffer cleared"
+        elif k == pygame.K_F2:
+            self.ctempl = (self.ctempl + 1) % len(CPU_TEMPLATES)
+            self.clines = CPU_TEMPLATES[self.ctempl].split("\n")
+            self.ccur = [0, 0]
+            self.status = "demo loaded"
+        else:
+            ch = getattr(e, "unicode", "") or ""
+            if ch and ch.isprintable():
+                self.clines[ln] = line[:col] + ch + line[col:]
+                self.ccur = [ln, col + 1]
+        if self.ccur[0] < self.cscroll:
+            self.cscroll = self.ccur[0]
+        if self.ccur[0] > self.cscroll + 22:
+            self.cscroll = self.ccur[0] - 22
+        return True
+
+    def draw_cedit(self):
+        import pygame
+        R = self.R
+        s = self.screen
+        w, h = 720, 470
+        x, y = (WIN_W - w) // 2, (WIN_H - h) // 2
+        veiled = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        veiled.fill((0, 0, 0, 150))
+        s.blit(veiled, (0, 0))
+        s.fill((14, 16, 21), (x, y, w, h))
+        pygame.draw.rect(s, (150, 210, 250), (x, y, w, h), 1)
+        c = None
+        if self.cpos:
+            li, cx, cy = self.cpos
+            if li < len(self.b.layers):
+                c = self.b.layers[li].cells.get((cx, cy))
+        err = (c.extra.get("err") if c else "") or ""
+        R.text("CPU PROGRAM", x + 12, y + 9, (170, 232, 200), R.f_mid)
+        R.text("ESC assemble+close   F2 demo   F3 clear   ENTER newline   TAB indent",
+               x + 160, y + 12, (120, 128, 142), R.f_tiny)
+        R.text("OPS  LDA LDB ADD SUB INC DEC AND ORA XOR SHL SHR CMP JMP JZ JNZ JC "
+               "OUT OFF IN DIN DLY ST LD HLT NOP", x + 12, y + h - 34, (110, 150, 190), R.f_tiny)
+        R.text("pins 0=up 1=right 2=down 3=left   A/B are 0-255   labels end with :",
+               x + 12, y + h - 20, (100, 108, 122), R.f_tiny)
+        if err:
+            R.text(err[:96], x + 12, y + 26, (255, 130, 130), R.f_tiny)
+        cw = max(6, R.size("M", R.f_tiny)[0])
+        top = y + 46
+        for i in range(self.cscroll, min(len(self.clines), self.cscroll + 26)):
+            ly = top + (i - self.cscroll) * 13
+            if ly > y + h - 52:
+                break
+            num = f"{i:02d}"
+            cur_line = i == self.ccur[0]
+            R.text(num, x + 10, ly, (90, 150, 200) if cur_line else (66, 72, 86), R.f_tiny)
+            R.text(self.clines[i][:96], x + 34, ly,
+                   (232, 238, 248) if cur_line else (168, 176, 190), R.f_tiny)
+            if cur_line:
+                cx2 = x + 34 + self.ccur[1] * cw
+                s.fill((170, 232, 200), (cx2, ly - 1, max(2, cw - 1), 12))
+
     # ---- main loop ---------------------------------------------------
     def update(self, dt):
         if not self.paused:
@@ -1623,6 +2211,8 @@ class App:
             self.draw_help()
         if self.mat_editor:
             self.draw_mat_editor()
+        if self.cedit:
+            self.draw_cedit()
 
     def draw_header(self):
         import pygame
@@ -1632,7 +2222,7 @@ class App:
         R.text("WATT//LAB", 14, 14, (255, 214, 120), R.f_big)
         R.text("pixel electronics sandbox", 132, 20, (110, 118, 132), R.f_tiny)
         x = BOARD_X
-        w = 72
+        w = 66
         for i, (kind, name, key, short) in enumerate(TOOLS):
             sel = (i == self.tool)
             col = (46, 52, 64) if sel else (30, 33, 41)
@@ -1810,8 +2400,32 @@ class App:
                 y += 13
                 first = False
 
+    def cpu_tip(self, c):
+        e = c.extra
+        code = e.get("code") or []
+        pc = e.get("pc", 0)
+        cur = "---"
+        if code:
+            op, arg = code[pc % len(code)]
+            cur = f"{op} {arg}"
+        dirmark = " ".join(
+            ("^" if e["pd"][d] == "out" else ".") for d in range(4))
+        lines = [f"CPU  {e.get('hz', 0):.1f} Hz   {'RUNNING' if e.get('run') else ('HALTED' if e.get('halt') else 'NO POWER')}",
+                 f"A={e.get('a', 0):3d}  B={e.get('b', 0):3d}   Z{e.get('z', 0)} C{e.get('c', 0)}",
+                 f"PC {pc:02d} {cur}",
+                 f"pins up/rt/dn/lt {dirmark}  out={sum(1 for q in e['pd'] if q == 'out')}",
+                 f"supply {e.get('vcc', 0):.2f} V   cycles {e.get('cycles', 0)}"]
+        if not e.get("run") and not e.get("halt"):
+            lines.append("! needs >= 2.5 V on any side")
+        if e.get("err"):
+            lines.append("! " + e["err"])
+        lines.append("E = edit program   , . = clock")
+        return lines, (170, 232, 200)
+
     def tooltip_lines(self, c):
         k = c.kind
+        if k == "cpu":
+            return self.cpu_tip(c)
         if k == "wire":
             return [f"WIRE {MATERIALS[c.mat]['name']}",
                     f"{c.v:.3f} V   {abs(c.extra.get('i',0))*1000:.2f} mA",
@@ -1851,7 +2465,7 @@ class App:
         import pygame
         R = self.R
         s = self.screen
-        if self.help or self.mat_editor or not self.inside(self.hover):
+        if self.help or self.mat_editor or self.cedit or not self.inside(self.hover):
             return
         c = self.b.layer.cells.get(self.hover)
         if c is None:
@@ -1882,7 +2496,7 @@ class App:
         s = self.screen
         s.fill((20, 22, 28), (0, BAR_Y + 4, WIN_W, WIN_H - BAR_Y))
         hints = ("LMB place   RMB erase   LMB+SHIFT aim (4 dirs)   R rotate   M material   "
-                 "C custom alloy   tools 1-0,-,=   , . / wheel value   SPACE pause   F1 help")
+                 "C custom alloy   tools 1-0,-,=`   E cpu code   SPACE pause   F1 help")
         R.text(hints, 12, BAR_Y + 10, (128, 136, 150), R.f_tiny)
         R.text("WATT//LAB v1.0  -  physics is the game", 12, BAR_Y + 26, (70, 76, 88), R.f_tiny)
 
@@ -1900,7 +2514,7 @@ class App:
             ("TOOLS          number row, left to right:", (200, 206, 216)),
             ("               1 wire  2 source  3 capacitor  4 voltmeter", None),
             ("               5 bridge  6 LED  7 resistor  8 heatsink", None),
-            ("               9 fan  0 via  - water  = eraser", None),
+            ("               9 fan  0 via  - water  = eraser  ` cpu", None),
             ("", None),
             ("MOUSE          LMB place / drag     RMB erase", (200, 206, 216)),
             ("               LMB + SHIFT + drag = set the 4-way direction", None),
